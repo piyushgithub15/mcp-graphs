@@ -1,0 +1,375 @@
+<div id="root">
+  <div id="head">
+    <span id="title">Waiting for nodes</span>
+    <div id="actions">
+      <span id="status"></span>
+      <span id="exportStatus" role="status" aria-live="polite"></span>
+      <button id="copyBtn" class="btn" type="button" disabled>Copy image</button>
+    </div>
+  </div>
+  <div id="staging"></div>
+  <div id="canvas"></div>
+</div>
+
+<style>
+  :root { color-scheme: light dark; }
+  #root {
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    color: var(--mcp-text, #1d1d1b);
+  }
+  /* flex-wrap + min-width:0 on the title keeps a long title from ever
+     overlapping the action buttons — it wraps to its own line instead. */
+  #head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 6px 12px;
+    margin-bottom: 10px;
+  }
+  #title {
+    font-size: 15px;
+    font-weight: 500;
+    min-width: 0;
+    flex: 1 1 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #actions {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 8px;
+    flex: 0 0 auto;
+  }
+  #status {
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    opacity: 0.55;
+    white-space: nowrap;
+  }
+  #exportStatus {
+    font-size: 12px;
+    opacity: 0.7;
+    white-space: nowrap;
+  }
+  .btn {
+    appearance: none;
+    border: 1px solid currentColor;
+    border-color: rgba(128, 128, 128, 0.35);
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: 12px;
+    line-height: 1.4;
+    padding: 5px 10px;
+    border-radius: 999px;
+    cursor: pointer;
+    opacity: 0.75;
+    white-space: nowrap;
+  }
+  .btn:hover:not(:disabled) { opacity: 1; border-color: currentColor; }
+  .btn:active:not(:disabled) { transform: translateY(1px); }
+  .btn:disabled { opacity: 0.3; cursor: default; }
+  #staging {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    min-height: 0;
+    transition: opacity 0.25s ease;
+  }
+  #staging.done { opacity: 0; height: 0; overflow: hidden; }
+  .pill {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+    opacity: 0.45;
+    animation: pop 0.22s ease;
+  }
+  @keyframes pop {
+    from { opacity: 0; transform: scale(0.9); }
+    to { opacity: 0.45; transform: scale(1); }
+  }
+  /* canvas sits in normal flow below #head/#staging, never underneath them,
+     so the diagram itself can never overlap the title/actions row. */
+  #canvas { width: 100%; height: 420px; }
+  @media (prefers-color-scheme: dark) {
+    #root { color: var(--mcp-text, #e8e6e1); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .pill { animation: none; }
+    #staging { transition: none; }
+  }
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+
+<script type="module">
+  import { App } from "https://cdn.jsdelivr.net/npm/@modelcontextprotocol/ext-apps@1/+esm";
+
+  cytoscape.use(cytoscapeDagre);
+
+  const titleEl = document.getElementById("title");
+  const statusEl = document.getElementById("status");
+  const stagingEl = document.getElementById("staging");
+  const exportStatusEl = document.getElementById("exportStatus");
+  const copyBtn = document.getElementById("copyBtn");
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  const GROUPS = ["#7F77DD", "#1D9E75", "#D85A30", "#378ADD", "#D4537E"];
+  const INK = dark ? "#e8e6e1" : "#1d1d1b";
+  const EDGE = dark ? "#6f6d66" : "#b4b2a9";
+
+  let built = false;
+  let seen = new Set();
+  let cy = null;
+
+  function normalize(args) {
+    if (!args || typeof args !== "object") return null;
+    const nodes = (Array.isArray(args.nodes) ? args.nodes : [])
+      .filter((n) => n && typeof n.id === "string")
+      .map((n) => ({
+        id: n.id,
+        label: typeof n.label === "string" ? n.label : n.id,
+        group: typeof n.group === "string" ? n.group : "",
+      }));
+    const ids = new Set(nodes.map((n) => n.id));
+    const edges = (Array.isArray(args.edges) ? args.edges : [])
+      .filter((e) => e && ids.has(e.source) && ids.has(e.target))
+      .map((e) => ({
+        source: e.source,
+        target: e.target,
+        label: typeof e.label === "string" ? e.label : "",
+      }));
+    return {
+      kind: args.kind === "graph" ? "graph" : "flowchart",
+      title: typeof args.title === "string" ? args.title : "Diagram",
+      direction: args.direction === "LR" ? "LR" : "TB",
+      nodes,
+      edges,
+    };
+  }
+
+  /**
+   * While arguments are still streaming, nodes land in a wrapping pill row.
+   * Deliberately not a graph: running layout on every partial would rearrange
+   * everything already on screen, which reads as broken rather than live.
+   */
+  function stage(args) {
+    if (built) return;
+    const spec = normalize(args);
+    if (!spec) return;
+
+    titleEl.textContent = spec.title;
+    for (const node of spec.nodes) {
+      if (seen.has(node.id)) continue;
+      seen.add(node.id);
+      const pill = document.createElement("span");
+      pill.className = "pill";
+      pill.textContent = node.label;
+      stagingEl.appendChild(pill);
+    }
+    statusEl.textContent = `${seen.size} nodes`;
+  }
+
+  const groupColor = (() => {
+    const assigned = new Map();
+    return (group) => {
+      if (!group) return dark ? "#5F5E5A" : "#888780";
+      if (!assigned.has(group)) {
+        assigned.set(group, GROUPS[assigned.size % GROUPS.length]);
+      }
+      return assigned.get(group);
+    };
+  })();
+
+  /**
+   * Layout runs exactly once against the complete node and edge set. Positions
+   * are solved up front, then elements are revealed along them — so a node that
+   * has appeared never moves again.
+   */
+  function build(args) {
+    const spec = normalize(args);
+    if (!spec || spec.nodes.length === 0 || built) return;
+    built = true;
+
+    titleEl.textContent = spec.title;
+    statusEl.textContent = `${spec.nodes.length} nodes, ${spec.edges.length} edges`;
+    stagingEl.classList.add("done");
+
+    cy = cytoscape({
+      container: document.getElementById("canvas"),
+      elements: [
+        ...spec.nodes.map((n) => ({
+          data: { id: n.id, label: n.label, color: groupColor(n.group) },
+        })),
+        ...spec.edges.map((e, i) => ({
+          data: {
+            id: `e${i}`,
+            source: e.source,
+            target: e.target,
+            label: e.label,
+          },
+        })),
+      ],
+      style: [
+        {
+          selector: "node",
+          style: {
+            "background-color": "data(color)",
+            "background-opacity": 0.16,
+            "border-width": 1,
+            "border-color": "data(color)",
+            shape: "round-rectangle",
+            label: "data(label)",
+            color: INK,
+            "font-size": 12,
+            "font-family": "ui-sans-serif, system-ui, sans-serif",
+            "text-valign": "center",
+            "text-halign": "center",
+            "text-wrap": "wrap",
+            "text-max-width": 130,
+            width: "label",
+            height: "label",
+            padding: 12,
+            opacity: 0,
+          },
+        },
+        {
+          selector: "edge",
+          style: {
+            width: 1.2,
+            "line-color": EDGE,
+            "target-arrow-color": EDGE,
+            "target-arrow-shape": "triangle",
+            "arrow-scale": 0.9,
+            "curve-style": spec.kind === "flowchart" ? "taxi" : "bezier",
+            "taxi-direction": spec.direction === "LR" ? "horizontal" : "vertical",
+            label: "data(label)",
+            "font-size": 11,
+            color: INK,
+            "text-background-color": dark ? "#17171a" : "#f6f5f2",
+            "text-background-opacity": 0.9,
+            "text-background-padding": 3,
+            "text-background-shape": "roundrectangle",
+            "text-rotation": "none",
+            opacity: 0,
+          },
+        },
+      ],
+      layout:
+        spec.kind === "flowchart"
+          ? {
+              name: "dagre",
+              rankDir: spec.direction,
+              // Dagre only sizes gaps off node dimensions, not edge label
+              // text, so ranks/lanes need extra room whenever edges carry
+              // labels — otherwise adjacent labels print on top of each
+              // other. Generous by default; cheap since layout runs once.
+              nodeSep: 55,
+              rankSep: 95,
+              edgeSep: 30,
+              fit: true,
+              padding: 24,
+            }
+          : {
+              name: "cose",
+              animate: false,
+              nodeRepulsion: 12000,
+              idealEdgeLength: 150,
+              fit: true,
+              padding: 24,
+            },
+      userZoomingEnabled: true,
+      userPanningEnabled: true,
+      autoungrabify: false,
+    });
+
+    if (reduced) {
+      cy.elements().style("opacity", 1);
+    } else {
+      // Reveal in topological-ish order: nodes as declared, then every edge.
+      const nodes = cy.nodes();
+      const step = Math.min(70, 900 / Math.max(nodes.length, 1));
+
+      nodes.forEach((node, i) => {
+        setTimeout(() => {
+          node.animate({ style: { opacity: 1 } }, { duration: 200 });
+        }, i * step);
+      });
+
+      setTimeout(
+        () => cy.edges().animate({ style: { opacity: 1 } }, { duration: 260 }),
+        nodes.length * step + 60,
+      );
+    }
+
+    copyBtn.disabled = false;
+  }
+
+  // ── Copy as image ──────────────────────────────────────────────────────
+  // Lets the rendered diagram be reused outside the chat — pasted straight
+  // into Excel, Slides, docs, or a flow-diagram tool as a plain PNG. (The
+  // tool result itself also ships a server-rendered PNG for headless
+  // clients — this button is for a human looking at the live view.)
+  function diagramPNGDataURL() {
+    return cy.png({
+      full: true,
+      scale: 2,
+      bg: dark ? "#17171a" : "#ffffff",
+    });
+  }
+
+  function dataUrlToBlob(dataUrl) {
+    const [meta, base64] = dataUrl.split(",");
+    const mime = /data:(.*?);base64/.exec(meta)?.[1] || "image/png";
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+  }
+
+  let statusTimer = null;
+  // Status text lives inline in the header next to the buttons (not a
+  // floating toast over the diagram), so it can never overlap the canvas.
+  function flashExportStatus(msg, ms = 2200) {
+    exportStatusEl.textContent = msg;
+    clearTimeout(statusTimer);
+    statusTimer = setTimeout(() => {
+      exportStatusEl.textContent = "";
+    }, ms);
+  }
+
+  copyBtn.addEventListener("click", async () => {
+    if (!cy) return;
+    if (!navigator.clipboard || typeof ClipboardItem === "undefined") {
+      flashExportStatus("Copy unsupported in this host");
+      return;
+    }
+    try {
+      const blob = dataUrlToBlob(diagramPNGDataURL());
+      await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+      flashExportStatus("Copied — paste into Excel, Slides, docs…");
+    } catch {
+      flashExportStatus("Copy blocked here");
+    }
+  });
+
+  const app = new App({ name: "graph-view", version: "1.0.0" }, { tools: {} });
+
+  app.ontoolinputpartial = ({ arguments: args }) => stage(args);
+  app.ontoolinput = ({ arguments: args }) => build(args);
+  // The complete input has usually already built the graph. Only fall back to
+  // the result if it has not — rebuilding would replay the whole reveal.
+  app.ontoolresult = (result) => {
+    if (!built && result?.structuredContent) build(result.structuredContent);
+  };
+
+  await app.connect();
+  app.setupSizeChangedNotifications();
+</script>

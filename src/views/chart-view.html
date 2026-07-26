@@ -1,0 +1,379 @@
+<div id="root">
+  <div id="head">
+    <span id="title">Waiting for data</span>
+    <div id="actions">
+      <span id="count"></span>
+      <span id="exportStatus" role="status" aria-live="polite"></span>
+      <button id="copyBtn" class="btn" type="button" disabled>Copy image</button>
+    </div>
+  </div>
+  <div id="canvas"></div>
+</div>
+
+<style>
+  :root { color-scheme: light dark; }
+  #root {
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    color: var(--mcp-text, #1d1d1b);
+  }
+  /* flex-wrap + min-width:0 on the title keeps a long title from ever
+     overlapping the action buttons — it wraps to its own line instead. */
+  #head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 6px 12px;
+    margin-bottom: 10px;
+  }
+  #title {
+    font-size: 15px;
+    font-weight: 500;
+    min-width: 0;
+    flex: 1 1 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #actions {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 8px;
+    flex: 0 0 auto;
+  }
+  #count {
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    opacity: 0.55;
+    white-space: nowrap;
+  }
+  #exportStatus {
+    font-size: 12px;
+    opacity: 0.7;
+    white-space: nowrap;
+  }
+  .btn {
+    appearance: none;
+    border: 1px solid currentColor;
+    border-color: rgba(128, 128, 128, 0.35);
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: 12px;
+    line-height: 1.4;
+    padding: 5px 10px;
+    border-radius: 999px;
+    cursor: pointer;
+    opacity: 0.75;
+    white-space: nowrap;
+  }
+  .btn:hover:not(:disabled) { opacity: 1; border-color: currentColor; }
+  .btn:active:not(:disabled) { transform: translateY(1px); }
+  .btn:disabled { opacity: 0.3; cursor: default; }
+  /* canvas sits in normal flow below #head, never underneath it, so the
+     chart(s) can never overlap the title/actions row. */
+  /* Single-chart mode (the default #canvas.single) stays fully responsive —
+     100% width, fixed height — matching the original single-canvas layout.
+     Multi-chart mode switches to a fixed-cell grid (sized in JS to match
+     chartCanvasSize on the server) so each cell has consistent, predictable
+     dimensions regardless of viewport width. */
+  #canvas.single { width: 100%; }
+  #canvas.grid {
+    display: grid;
+    gap: 16px;
+  }
+  .chart-cell {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    border: 1px solid rgba(128, 128, 128, 0.2);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .chart-cell-title {
+    padding: 6px 10px 0;
+    font-size: 12px;
+    font-weight: 500;
+    opacity: 0.75;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .chart-cell-mount { width: 480px; height: 300px; }
+  /* Single-chart mode reuses the one cell at full width/height with no
+     border/mini-title, matching the original single-canvas layout exactly. */
+  #canvas.single .chart-cell { border: none; }
+  #canvas.single .chart-cell-title { display: none; }
+  #canvas.single .chart-cell-mount { width: 100%; height: 340px; }
+  @media (prefers-color-scheme: dark) {
+    #root { color: var(--mcp-text, #e8e6e1); }
+  }
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+
+<script type="module">
+  import { App } from "https://cdn.jsdelivr.net/npm/@modelcontextprotocol/ext-apps@1/+esm";
+
+  const titleEl = document.getElementById("title");
+  const countEl = document.getElementById("count");
+  const exportStatusEl = document.getElementById("exportStatus");
+  const copyBtn = document.getElementById("copyBtn");
+  const canvasRoot = document.getElementById("canvas");
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+
+  const PALETTE = ["#7F77DD", "#1D9E75", "#D85A30", "#378ADD", "#D4537E"];
+
+  /**
+   * Partial arguments arrive as incompletely-parsed JSON, so every field is
+   * treated as optional and possibly half-written. Anything malformed is
+   * dropped rather than thrown — the next partial will supersede it.
+   */
+  function cleanChart(args) {
+    if (!args || typeof args !== "object") return null;
+    const series = Array.isArray(args.series) ? args.series : [];
+    const usable = series
+      .filter((s) => s && Array.isArray(s.points))
+      .map((s) => ({
+        name: typeof s.name === "string" ? s.name : "series",
+        points: s.points.filter(
+          (p) => p && p.x !== undefined && typeof p.y === "number",
+        ),
+      }));
+    return {
+      kind: ["line", "bar", "scatter", "area"].includes(args.kind)
+        ? args.kind
+        : "line",
+      title: typeof args.title === "string" ? args.title : "",
+      xLabel: typeof args.xLabel === "string" ? args.xLabel : "",
+      yLabel: typeof args.yLabel === "string" ? args.yLabel : "",
+      series: usable,
+    };
+  }
+
+  function clean(args) {
+    const raw = args && Array.isArray(args.charts) ? args.charts : [];
+    return raw.map(cleanChart).filter((c) => c !== null);
+  }
+
+  function toEchartsSeries(spec) {
+    const type = spec.kind === "area" ? "line" : spec.kind;
+    return spec.series.map((s, i) => ({
+      name: s.name,
+      type,
+      data: s.points.map((p) => [p.x, p.y]),
+      smooth: spec.kind === "line" || spec.kind === "area",
+      symbolSize: spec.kind === "scatter" ? 9 : 5,
+      areaStyle: spec.kind === "area" ? { opacity: 0.18 } : undefined,
+      itemStyle: { color: PALETTE[i % PALETTE.length] },
+      lineStyle: { width: 2 },
+    }));
+  }
+
+  function gridColumns(n) {
+    return n <= 4 ? 2 : 3;
+  }
+
+  /**
+   * One ECharts instance per chart cell. Cells are created/torn down as the
+   * charts array grows/shrinks between partials — this only churns instances
+   * when the *count* changes, not on every redraw.
+   */
+  let cells = []; // { cell, titleEl, inst }
+
+  function ensureCells(n) {
+    if (n === cells.length) return;
+
+    while (cells.length < n) {
+      const cellEl = document.createElement("div");
+      cellEl.className = "chart-cell";
+      const cellTitleEl = document.createElement("div");
+      cellTitleEl.className = "chart-cell-title";
+      const mountEl = document.createElement("div");
+      mountEl.className = "chart-cell-mount";
+      cellEl.append(cellTitleEl, mountEl);
+      canvasRoot.appendChild(cellEl);
+      const inst = echarts.init(mountEl, dark ? "dark" : null, { renderer: "canvas" });
+      inst.getDom().style.background = "transparent";
+      cells.push({ cell: cellEl, titleEl: cellTitleEl, inst });
+    }
+    while (cells.length > n) {
+      const { cell, inst } = cells.pop();
+      inst.dispose();
+      cell.remove();
+    }
+
+    const isSingle = n <= 1;
+    canvasRoot.classList.toggle("single", isSingle);
+    canvasRoot.classList.toggle("grid", !isSingle);
+    canvasRoot.style.gridTemplateColumns = isSingle
+      ? ""
+      : `repeat(${gridColumns(n)}, 480px)`;
+    // Mode switch (single <-> grid) changes each mount's CSS size instantly;
+    // ECharts needs an explicit nudge to pick up the new container size.
+    // Synchronous (not rAF) so the headless one-shot render path — which
+    // draws once and screenshots shortly after, with no further frames in
+    // between — always reflects the right size.
+    cells.forEach(({ inst }) => inst.resize());
+  }
+
+  function drawChart(spec, { inst, titleEl: cellTitleEl }, showCellTitle) {
+    if (showCellTitle) cellTitleEl.textContent = spec.title || "Chart";
+
+    const categorical = spec.series.some((s) =>
+      s.points.some((p) => typeof p.x === "string"),
+    );
+
+    inst.setOption({
+      animationDuration: 320,
+      animationDurationUpdate: 320,
+      grid: { left: 48, right: 16, top: 20, bottom: 40, containLabel: true },
+      tooltip: { trigger: "axis" },
+      legend: spec.series.length > 1 ? { bottom: 0, icon: "roundRect", textStyle: { fontSize: 10 } } : undefined,
+      xAxis: {
+        type: categorical ? "category" : "value",
+        name: spec.xLabel,
+        nameLocation: "middle",
+        nameGap: 26,
+        splitLine: { show: false },
+      },
+      yAxis: {
+        type: "value",
+        name: spec.yLabel,
+        nameLocation: "middle",
+        nameGap: 36,
+      },
+      series: toEchartsSeries(spec),
+    });
+  }
+
+  /**
+   * setOption merges by default, so re-issuing it with a longer data array
+   * appends points and animates the transition. Nothing already drawn moves.
+   */
+  function draw(args) {
+    const charts = clean(args);
+    ensureCells(charts.length);
+
+    const showCellTitles = charts.length > 1;
+    let totalPoints = 0;
+    charts.forEach((spec, i) => {
+      totalPoints += spec.series.reduce((n, s) => n + s.points.length, 0);
+      drawChart(spec, cells[i], showCellTitles);
+    });
+
+    titleEl.textContent =
+      charts.length === 0
+        ? "Waiting for data"
+        : charts.length === 1
+          ? charts[0].title || "Chart"
+          : `${charts.length} charts`;
+    countEl.textContent = totalPoints ? `${totalPoints} points` : "";
+    copyBtn.disabled = totalPoints === 0;
+  }
+
+  // ── Copy as image ──────────────────────────────────────────────────────
+  // Lets the rendered chart(s) be reused outside the chat — pasted straight
+  // into Excel, Slides, docs, or a flow-diagram tool as a plain PNG. (The
+  // tool result itself also ships a server-rendered PNG for headless
+  // clients — this button is for a human looking at the live view.)
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = src;
+    });
+  }
+
+  async function chartsPNGDataURL() {
+    if (cells.length === 0) return null;
+    const bg = dark ? "#17171a" : "#ffffff";
+    if (cells.length === 1) {
+      return cells[0].inst.getDataURL({ type: "png", pixelRatio: 2, backgroundColor: bg });
+    }
+    // Composite every cell's own canvas onto one image, positioned to match
+    // their actual on-screen grid layout.
+    const rootRect = canvasRoot.getBoundingClientRect();
+    const scale = 2;
+    const composite = document.createElement("canvas");
+    composite.width = Math.round(rootRect.width * scale);
+    composite.height = Math.round(rootRect.height * scale);
+    const ctx = composite.getContext("2d");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, composite.width, composite.height);
+    for (const { cell, inst } of cells) {
+      const cellRect = cell.getBoundingClientRect();
+      const img = await loadImage(
+        inst.getDataURL({ type: "png", pixelRatio: scale, backgroundColor: "transparent" }),
+      );
+      ctx.drawImage(
+        img,
+        Math.round((cellRect.left - rootRect.left) * scale),
+        Math.round((cellRect.top - rootRect.top) * scale),
+        Math.round(cellRect.width * scale),
+        Math.round(cellRect.height * scale),
+      );
+    }
+    return composite.toDataURL("image/png");
+  }
+
+  function dataUrlToBlob(dataUrl) {
+    const [meta, base64] = dataUrl.split(",");
+    const mime = /data:(.*?);base64/.exec(meta)?.[1] || "image/png";
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+  }
+
+  let statusTimer = null;
+  // Status text lives inline in the header next to the buttons (not a
+  // floating toast over the chart), so it can never overlap the canvas.
+  function flashExportStatus(msg, ms = 2200) {
+    exportStatusEl.textContent = msg;
+    clearTimeout(statusTimer);
+    statusTimer = setTimeout(() => {
+      exportStatusEl.textContent = "";
+    }, ms);
+  }
+
+  copyBtn.addEventListener("click", async () => {
+    if (!navigator.clipboard || typeof ClipboardItem === "undefined") {
+      flashExportStatus("Copy unsupported in this host");
+      return;
+    }
+    try {
+      const dataUrl = await chartsPNGDataURL();
+      if (!dataUrl) throw new Error("nothing to copy");
+      const blob = dataUrlToBlob(dataUrl);
+      await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+      flashExportStatus("Copied — paste into Excel, Slides, docs…");
+    } catch {
+      flashExportStatus("Copy blocked here");
+    }
+  });
+
+  const app = new App(
+    { name: "chart-view", version: "1.0.0" },
+    { tools: {} },
+  );
+
+  // Fires repeatedly while the model is still writing the arguments. This is
+  // where the live drawing happens — before the tool has even executed.
+  app.ontoolinputpartial = ({ arguments: args }) => draw(args);
+
+  // Fires once the arguments are complete but execution has not returned.
+  app.ontoolinput = ({ arguments: args }) => draw(args);
+
+  // Fires with the server's validated result. Authoritative — overwrite.
+  app.ontoolresult = (result) => {
+    if (result?.structuredContent) draw(result.structuredContent);
+  };
+
+  window.addEventListener("resize", () => cells.forEach(({ inst }) => inst.resize()));
+
+  await app.connect();
+  app.setupSizeChangedNotifications();
+</script>
