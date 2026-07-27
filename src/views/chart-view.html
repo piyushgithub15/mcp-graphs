@@ -225,6 +225,7 @@
     const years = !categorical && looksLikeYears(nums);
     return {
       categorical,
+      categories: categorical ? [...new Set(xs.map(String))] : [],
       years,
       integerX: !categorical && nums.length > 0 && nums.every(Number.isInteger),
       formatX: categorical
@@ -243,7 +244,7 @@
   function cleanChart(args) {
     if (!args || typeof args !== "object") return null;
     const series = Array.isArray(args.series) ? args.series : [];
-    const usable = series
+    let usable = series
       .filter((s) => s && Array.isArray(s.points))
       .map((s) => ({
         name: typeof s.name === "string" ? s.name : "series",
@@ -251,6 +252,23 @@
           (p) => p && p.x !== undefined && typeof p.y === "number",
         ),
       }));
+
+    // A model that built its series from a dict emits points in whatever order
+    // it happened to iterate. ECharts joins a line in ARRAY order, not x
+    // order, so unsorted input draws as spaghetti across the whole plot and
+    // strands the end label on a mid-chart point. Sort numeric domains here so
+    // the chart and the table agree. Category axes keep declaration order —
+    // there the sequence IS the axis, and re-ordering it would be wrong.
+    const anyCategorical = usable.some((s) =>
+      s.points.some((p) => typeof p.x === "string"),
+    );
+    if (!anyCategorical) {
+      usable = usable.map((s) => ({
+        name: s.name,
+        points: [...s.points].sort((a, b) => a.x - b.x),
+      }));
+    }
+
     return {
       kind: ["line", "bar", "scatter", "area"].includes(args.kind)
         ? args.kind
@@ -394,6 +412,31 @@
 
     const ax = axisInfo(spec);
     const multi = spec.series.length > 1;
+    // Long or numerous category names don't fit horizontally, and hideOverlap
+    // answers that by dropping labels — which on a category axis means bars
+    // you cannot identify at all. Rotating keeps every name attached to its
+    // bar; truncation caps how much space the longest one can eat.
+    //
+    // containLabel does NOT reserve horizontal room for a rotated label's
+    // overhang, so the leftmost one runs off the canvas unless grid.left
+    // covers it, and the axis name has to clear the whole rotated band rather
+    // than one line of text. Both fall out of the triangle, so derive them
+    // instead of hand-tuning two numbers that must agree.
+    // Rotate only when the labels genuinely don't fit: a handful of short
+    // names in a wide chart reads better flat. The instance already knows its
+    // own width, so compare the widest name against the room one category
+    // actually gets instead of guessing from a name-length threshold.
+    const CHAR_PX = 6.2; // 11px system sans, approximate advance width
+    const perCategory =
+      (inst.getWidth() - 80) / Math.max(ax.categories.length, 1);
+    const widestCategory =
+      ax.categories.reduce((n, c) => Math.max(n, String(c).length), 0) * CHAR_PX;
+    const longCategories = ax.categorical && widestCategory > perCategory;
+    const LABEL_ROTATE = 45;
+    const LABEL_WIDTH = 96; // truncation cap, px
+    const rad = (LABEL_ROTATE * Math.PI) / 180;
+    const labelOverhang = Math.ceil(LABEL_WIDTH * Math.cos(rad));
+    const labelBand = Math.ceil(LABEL_WIDTH * Math.sin(rad));
     // Bars and filled areas encode magnitude by extent, so their baseline has
     // to be zero or the lengths lie. A line or scatter encodes position —
     // pinning it to zero just flattens the shape into a stripe.
@@ -409,7 +452,7 @@
         // containLabel reserves room for tick LABELS only — an axis *name* is
         // laid out beyond that and gets clipped off the canvas unless the
         // corresponding side is padded here. Hence the per-side bumps.
-        left: 8,
+        left: longCategories ? labelOverhang + 4 : 8,
         right: endLabels ? 56 : 16,
         top: (multi ? 34 : 12) + (spec.yLabel ? 18 : 0),
         bottom: spec.xLabel ? 28 : 6,
@@ -442,7 +485,7 @@
         type: ax.categorical ? "category" : "value",
         name: spec.xLabel || "",
         nameLocation: "middle",
-        nameGap: 28,
+        nameGap: longCategories ? labelBand + 16 : 28,
         nameTextStyle: { color: INK.secondary, fontSize: 11 },
         // A value axis defaults to scale:false, which forces zero into the
         // range. On a 1974–2024 axis that stretches the plot to 0–2500 and
@@ -465,6 +508,9 @@
           color: INK.muted,
           fontSize: 11,
           hideOverlap: true,
+          rotate: longCategories ? LABEL_ROTATE : 0,
+          overflow: longCategories ? "truncate" : undefined,
+          width: longCategories ? LABEL_WIDTH : undefined,
           formatter: ax.categorical ? undefined : ax.formatX,
         },
         splitLine: { show: false },

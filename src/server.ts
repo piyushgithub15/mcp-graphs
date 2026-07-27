@@ -450,6 +450,38 @@ export function createApp() {
     });
   });
 
+  // Which kinds actually have data, pushed as it arrives. /preview uses this
+  // to mount only the panes that have something in them — an empty frame
+  // captioned "Waiting for data" is noise, not information.
+  app.get("/preview/presence", (req, res) => {
+    res.set({
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    res.flushHeaders();
+
+    const send = () =>
+      res.write(
+        `data: ${JSON.stringify({
+          chart: latestByKind.chart !== undefined,
+          graph: latestByKind.graph !== undefined,
+        })}\n\n`,
+      );
+    send();
+
+    const onUpdate = () => send();
+    liveUpdates.on("chart", onUpdate);
+    liveUpdates.on("graph", onUpdate);
+    const heartbeat = setInterval(() => res.write(": ping\n\n"), 25000);
+
+    req.on("close", () => {
+      liveUpdates.off("chart", onUpdate);
+      liveUpdates.off("graph", onUpdate);
+      clearInterval(heartbeat);
+    });
+  });
+
   // Each view needs the ext-apps import remapped to a different
   // live-bridge.js query param, which an import map can't express for two
   // inline modules in one document. So each view still gets its own
@@ -480,16 +512,15 @@ export function createApp() {
   @media (prefers-color-scheme: dark) {
     body { background: #17171a; color: #e8e6e1; }
   }
-  header {
-    padding: 14px 18px 10px;
-    border-bottom: 1px solid rgba(128,128,128,0.25);
-  }
-  header h1 { margin: 0; font-size: 15px; font-weight: 600; }
-  header p { margin: 4px 0 0; font-size: 12px; opacity: 0.6; }
-  /* Two independent panes laid out with grid, never stacked on top of each
-     other: side by side once there's room, one full-width column below
-     that. Each pane has its own scroll/frame area, so nothing bleeds
-     into its neighbor even while both are live-updating at once. */
+  /* No page chrome — the rendered chart or diagram IS the page. Each view
+     already carries its own title row, so a heading above it would just
+     repeat itself.
+
+     A pane is mounted only once its kind actually has data, so this is the
+     chart, the diagram, or both — never an empty frame captioned "Waiting
+     for data". A lone pane takes the full width and more height; two sit
+     side by side once there's room, each with its own frame so neither
+     bleeds into the other while both are live-updating. */
   #panes {
     display: grid;
     grid-template-columns: 1fr;
@@ -498,54 +529,78 @@ export function createApp() {
     box-sizing: border-box;
   }
   @media (min-width: 900px) {
-    #panes { grid-template-columns: 1fr 1fr; }
+    #panes.both { grid-template-columns: 1fr 1fr; }
   }
   .pane {
     display: flex;
-    flex-direction: column;
     min-width: 0;
     border: 1px solid rgba(128,128,128,0.25);
     border-radius: 10px;
     overflow: hidden;
     background: rgba(128,128,128,0.04);
   }
-  .pane h2 {
-    margin: 0;
-    padding: 8px 12px;
-    font-size: 12px;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    text-transform: uppercase;
-    opacity: 0.6;
-    border-bottom: 1px solid rgba(128,128,128,0.2);
-  }
   .pane iframe {
     display: block;
     width: 100%;
     height: 480px;
     border: none;
-    /* flex-basis:auto (not the flex:1 shorthand's 0%) so the 480px height
-       above is actually honored instead of collapsing to the browser's
-       default 150px iframe height. */
+    /* flex-basis:auto (not the flex:1 shorthand's 0%) so the height above is
+       actually honored instead of collapsing to the browser's default 150px
+       iframe height. */
     flex: 0 1 auto;
   }
+  /* Just past the view's own content height (title row + 400px canvas + its
+     16px body margins) — enough that a taller diagram layout isn't cropped,
+     without leaving a slab of dead pane below a chart. */
+  #panes.one .pane iframe { height: 520px; }
+  /* Nothing rendered yet: one quiet line, not a pair of empty boxes. */
+  #idle { padding: 18px; margin: 0; font-size: 13px; opacity: 0.5; }
+  /* display on .pane/#panes would otherwise beat the hidden attribute. */
+  #idle[hidden], .pane[hidden], #panes[hidden] { display: none; }
 </style>
 </head>
 <body>
-<header>
-  <h1>viz-mcp preview</h1>
-  <p>Live output from real render_chart / render_diagram tool calls — both shown at once, no tab switching.</p>
-</header>
-<div id="panes">
-  <div class="pane">
-    <h2>Chart</h2>
-    <iframe src="/preview/chart" allow="clipboard-write"></iframe>
-  </div>
-  <div class="pane">
-    <h2>Graph</h2>
-    <iframe src="/preview/graph" allow="clipboard-write"></iframe>
-  </div>
+<p id="idle">Waiting for a chart or diagram…</p>
+<div id="panes" hidden>
+  <div class="pane" id="pane-chart" hidden></div>
+  <div class="pane" id="pane-graph" hidden></div>
 </div>
+<script>
+  const panes = document.getElementById("panes");
+  const idle = document.getElementById("idle");
+  const mounted = {};
+
+  // Mount lazily: a kind that never renders never loads its view at all.
+  function ensure(kind) {
+    const pane = document.getElementById("pane-" + kind);
+    if (!mounted[kind]) {
+      const frame = document.createElement("iframe");
+      frame.src = "/preview/" + kind;
+      frame.title = kind === "chart" ? "Chart" : "Diagram";
+      frame.setAttribute("allow", "clipboard-write");
+      pane.appendChild(frame);
+      mounted[kind] = true;
+    }
+    pane.hidden = false;
+  }
+
+  const source = new EventSource("/preview/presence");
+  source.onmessage = (event) => {
+    let present;
+    try {
+      present = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (present.chart) ensure("chart");
+    if (present.graph) ensure("graph");
+    const shown = (present.chart ? 1 : 0) + (present.graph ? 1 : 0);
+    panes.classList.toggle("both", shown === 2);
+    panes.classList.toggle("one", shown === 1);
+    panes.hidden = shown === 0;
+    idle.hidden = shown > 0;
+  };
+</script>
 </body>
 </html>`);
   });
