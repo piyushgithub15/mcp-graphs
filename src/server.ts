@@ -161,12 +161,51 @@ async function appendRenderedImage(
   args: unknown,
   width: number,
   height: number,
+  exportAs: string,
 ): Promise<void> {
   try {
     const png = await renderViewPNG({ viewFile, args, width, height, port: PORT });
     content.push({ type: "image", data: png.toString("base64"), mimeType: "image/png" });
+    recordExport(exportAs, png);
   } catch (err) {
     console.error(`failed to render ${viewFile} to PNG`, err);
+  }
+}
+
+/**
+ * Every PNG this process has rendered, keyed by a filename derived from the
+ * chart or diagram title.
+ *
+ * A Graphs MCP pod is provisioned per turn and torn down with it, so a URL
+ * into it stops resolving the moment the turn ends — which means an inline
+ * image in a tool result is the only trace a render leaves, and it dies with
+ * the pod. Holding the bytes here lets the executor copy them into the
+ * agent's workspace before teardown, so a rendered chart becomes a real
+ * artifact on the completed turn rather than a picture that only ever existed
+ * inside a preview iframe.
+ */
+const renderedExports = new Map<string, Buffer>();
+const MAX_EXPORTS = 24;
+
+/** Slugs a title into a safe, readable download filename. */
+function exportName(title: string, fallback: string): string {
+  const slug = String(title ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+  return `${slug || fallback}.png`;
+}
+
+function recordExport(name: string, png: Buffer): void {
+  // Re-rendering the same title supersedes the earlier version rather than
+  // attaching the agent two near-identical images.
+  renderedExports.delete(name);
+  renderedExports.set(name, png);
+  while (renderedExports.size > MAX_EXPORTS) {
+    const oldest = renderedExports.keys().next().value;
+    if (oldest === undefined) break;
+    renderedExports.delete(oldest);
   }
 }
 
@@ -287,7 +326,13 @@ export function buildServer(): McpServer {
         { type: "text", text: summary },
       ];
       const { width, height } = chartCanvasSize(args.charts.length);
-      await appendRenderedImage(content, "chart-view.html", args, width, height);
+      const exportAs = exportName(
+        args.charts.length === 1
+          ? args.charts[0].title
+          : `${args.charts[0].title}-and-${args.charts.length - 1}-more`,
+        "chart",
+      );
+      await appendRenderedImage(content, "chart-view.html", args, width, height, exportAs);
 
       return { content, structuredContent: args };
     },
@@ -341,7 +386,14 @@ export function buildServer(): McpServer {
           text: `Rendered ${args.kind} "${args.title}" with ${args.nodes.length} nodes and ${args.edges.length} edges.`,
         },
       ];
-      await appendRenderedImage(content, "graph-view.html", args, 720, 460);
+      await appendRenderedImage(
+        content,
+        "graph-view.html",
+        args,
+        720,
+        460,
+        exportName(args.title, "diagram"),
+      );
 
       return { content, structuredContent: args };
     },
@@ -448,6 +500,28 @@ export function createApp() {
       liveUpdates.off(kind, onUpdate);
       clearInterval(heartbeat);
     });
+  });
+
+  // The turn's rendered PNGs, for the executor to copy into the agent's
+  // workspace before this pod is deprovisioned. Deliberately under the
+  // /preview prefix: that path is already routed by the ingress, so exposing
+  // downloads needs no new ingress rule.
+  app.get("/preview/exports", (_req, res) => {
+    res.json({
+      files: [...renderedExports.entries()].map(([name, png]) => ({
+        name,
+        bytes: png.length,
+      })),
+    });
+  });
+
+  app.get("/preview/exports/:name", (req, res) => {
+    const png = renderedExports.get(req.params.name);
+    if (!png) {
+      res.status(404).json({ error: `no export named ${req.params.name}` });
+      return;
+    }
+    res.type("png").send(png);
   });
 
   // Which kinds actually have data, pushed as it arrives. /preview uses this

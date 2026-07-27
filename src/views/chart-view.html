@@ -705,20 +705,61 @@
     }, ms);
   }
 
+  /**
+   * Clipboard access is a Permissions Policy feature delegated by whatever
+   * page frames this view. A host that embeds the preview in an iframe
+   * without `allow="clipboard-write"` leaves the API present but every write
+   * rejecting — so check the policy rather than discovering it by failure,
+   * and say which side is blocking it.
+   */
+  function clipboardDelegated() {
+    if (!navigator.clipboard || typeof ClipboardItem === "undefined") return false;
+    try {
+      return document.featurePolicy?.allowsFeature?.("clipboard-write") ?? true;
+    } catch {
+      return true; // No featurePolicy to consult — just try the write.
+    }
+  }
+
+  /** Saving the PNG reaches the same destinations a paste would. */
+  function downloadPNG(dataUrl) {
+    const name =
+      (titleEl.textContent || "chart").replace(/[^\w.-]+/g, "-").slice(0, 60) || "chart";
+    const link = document.createElement("a");
+    link.href = dataUrl;
+    link.download = `${name}.png`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
   copyBtn.addEventListener("click", async () => {
-    if (!navigator.clipboard || typeof ClipboardItem === "undefined") {
-      flashExportStatus("Copy unsupported in this host");
+    // Start the render before anything is awaited, and hand ClipboardItem the
+    // PENDING blob. Compositing a multi-chart grid decodes images, and that
+    // gap is long enough for the click's transient activation to expire,
+    // which Chrome rejects; a promise-valued ClipboardItem keeps the write
+    // attached to the original gesture.
+    const pending = chartsPNGDataURL();
+
+    if (clipboardDelegated()) {
+      try {
+        await navigator.clipboard.write([
+          new ClipboardItem({ "image/png": pending.then(dataUrlToBlob) }),
+        ]);
+        flashExportStatus("Copied — paste into Excel, Slides, docs…");
+        return;
+      } catch {
+        // Fall through — a download still gets the image out.
+      }
+    }
+
+    const dataUrl = await pending.catch(() => null);
+    if (!dataUrl) {
+      flashExportStatus("Nothing to copy yet");
       return;
     }
-    try {
-      const dataUrl = await chartsPNGDataURL();
-      if (!dataUrl) throw new Error("nothing to copy");
-      const blob = dataUrlToBlob(dataUrl);
-      await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
-      flashExportStatus("Copied — paste into Excel, Slides, docs…");
-    } catch {
-      flashExportStatus("Copy blocked here");
-    }
+    downloadPNG(dataUrl);
+    flashExportStatus("Clipboard blocked by this page — saved as PNG instead", 3200);
   });
 
   const app = new App(

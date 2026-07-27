@@ -345,19 +345,52 @@
     }, ms);
   }
 
+  /**
+   * Clipboard access is a Permissions Policy feature delegated by whatever
+   * page frames this view. A host that embeds the preview in an iframe
+   * without `allow="clipboard-write"` leaves the API present but every write
+   * rejecting — so check the policy rather than discovering it by failure,
+   * and say which side is blocking it.
+   */
+  function clipboardDelegated() {
+    if (!navigator.clipboard || typeof ClipboardItem === "undefined") return false;
+    try {
+      return document.featurePolicy?.allowsFeature?.("clipboard-write") ?? true;
+    } catch {
+      return true; // No featurePolicy to consult — just try the write.
+    }
+  }
+
+  /** Saving the PNG reaches the same destinations a paste would. */
+  function downloadPNG(dataUrl) {
+    const name =
+      (titleEl.textContent || "diagram").replace(/[^\w.-]+/g, "-").slice(0, 60) || "diagram";
+    const link = document.createElement("a");
+    link.href = dataUrl;
+    link.download = `${name}.png`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
   copyBtn.addEventListener("click", async () => {
     if (!cy) return;
-    if (!navigator.clipboard || typeof ClipboardItem === "undefined") {
-      flashExportStatus("Copy unsupported in this host");
-      return;
+    const dataUrl = diagramPNGDataURL();
+
+    if (clipboardDelegated()) {
+      try {
+        await navigator.clipboard.write([
+          new ClipboardItem({ "image/png": dataUrlToBlob(dataUrl) }),
+        ]);
+        flashExportStatus("Copied — paste into Excel, Slides, docs…");
+        return;
+      } catch {
+        // Fall through — a download still gets the image out.
+      }
     }
-    try {
-      const blob = dataUrlToBlob(diagramPNGDataURL());
-      await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
-      flashExportStatus("Copied — paste into Excel, Slides, docs…");
-    } catch {
-      flashExportStatus("Copy blocked here");
-    }
+
+    downloadPNG(dataUrl);
+    flashExportStatus("Clipboard blocked by this page — saved as PNG instead", 3200);
   });
 
   const app = new App({ name: "graph-view", version: "1.0.0" }, { tools: {} });
