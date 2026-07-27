@@ -4,10 +4,15 @@
     <div id="actions">
       <span id="count"></span>
       <span id="exportStatus" role="status" aria-live="polite"></span>
+      <button id="tableBtn" class="btn" type="button" aria-expanded="false" disabled>Table</button>
       <button id="copyBtn" class="btn" type="button" disabled>Copy image</button>
     </div>
   </div>
   <div id="canvas"></div>
+  <!-- The chart's table twin. Deliberately OUTSIDE #canvas: the headless PNG
+       render screenshots #canvas alone, so opening the table never changes
+       the exported image. -->
+  <div id="tableWrap" hidden></div>
 </div>
 
 <style>
@@ -105,7 +110,33 @@
      border/mini-title, matching the original single-canvas layout exactly. */
   #canvas.single .chart-cell { border: none; }
   #canvas.single .chart-cell-title { display: none; }
-  #canvas.single .chart-cell-mount { width: 100%; height: 340px; }
+  #canvas.single .chart-cell-mount { width: 100%; height: 400px; }
+  /* Table twin — the WCAG-clean equivalent of the plot. Scrolls inside its
+     own box so a wide table never makes the whole view scroll sideways. */
+  #tableWrap { margin-top: 14px; overflow-x: auto; }
+  #tableWrap table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  #tableWrap caption {
+    text-align: left;
+    font-size: 12px;
+    font-weight: 500;
+    opacity: 0.75;
+    padding: 10px 0 6px;
+  }
+  #tableWrap th,
+  #tableWrap td {
+    text-align: right;
+    padding: 4px 10px;
+    white-space: nowrap;
+    border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+  }
+  #tableWrap th:first-child,
+  #tableWrap td:first-child { text-align: left; }
+  #tableWrap thead th { font-weight: 500; opacity: 0.7; }
   @media (prefers-color-scheme: dark) {
     #root { color: var(--mcp-text, #e8e6e1); }
   }
@@ -120,10 +151,89 @@
   const countEl = document.getElementById("count");
   const exportStatusEl = document.getElementById("exportStatus");
   const copyBtn = document.getElementById("copyBtn");
+  const tableBtn = document.getElementById("tableBtn");
+  const tableWrap = document.getElementById("tableWrap");
   const canvasRoot = document.getElementById("canvas");
   const dark = matchMedia("(prefers-color-scheme: dark)").matches;
 
-  const PALETTE = ["#7F77DD", "#1D9E75", "#D85A30", "#378ADD", "#D4537E"];
+  /**
+   * Validated categorical palette — eight fixed hues, each mode stepped for
+   * its own surface (not an automatic flip of the light values). Slots are
+   * assigned in declaration order and NEVER cycled: a ninth generated hue is
+   * indistinguishable from an earlier slot under colour-vision deficiency, so
+   * the tail goes muted grey and leans on the legend and direct labels
+   * instead of pretending to be a distinct series colour.
+   */
+  const PALETTE_LIGHT = [
+    "#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+    "#e87ba4", "#008300", "#4a3aa7", "#e34948",
+  ];
+  const PALETTE_DARK = [
+    "#3987e5", "#d95926", "#199e70", "#c98500",
+    "#d55181", "#008300", "#9085e9", "#e66767",
+  ];
+
+  /** Chart chrome. Grid/axis/label ink is recessive — one shade off the surface. */
+  const INK = dark
+    ? { surface: "#1a1a19", primary: "#ffffff", secondary: "#c3c2b7", muted: "#898781", grid: "#2c2c2a", axis: "#383835" }
+    : { surface: "#fcfcfb", primary: "#0b0b0b", secondary: "#52514e", muted: "#898781", grid: "#e1e0d9", axis: "#c3c2b7" };
+
+  const PALETTE = dark ? PALETTE_DARK : PALETTE_LIGHT;
+  const seriesColor = (i) => PALETTE[i] ?? INK.muted;
+
+  const escapeHTML = (s) =>
+    String(s).replace(
+      /[&<>"']/g,
+      (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
+    );
+
+  const trimZeros = (n, digits) => Number(n.toFixed(digits)).toString();
+
+  /** Axis ticks and end labels: compact past 10k so ticks never collide. */
+  function formatCompact(v) {
+    if (typeof v !== "number" || !Number.isFinite(v)) return String(v);
+    const abs = Math.abs(v);
+    if (abs >= 1e9) return `${trimZeros(v / 1e9, 1)}B`;
+    if (abs >= 1e6) return `${trimZeros(v / 1e6, 1)}M`;
+    if (abs >= 1e4) return `${trimZeros(v / 1e3, 1)}k`;
+    if (abs >= 1) return trimZeros(v, 2);
+    return trimZeros(v, 4);
+  }
+
+  /** Tooltips and the table: full precision, digit-grouped. */
+  function formatFull(v) {
+    if (typeof v !== "number" || !Number.isFinite(v)) return String(v);
+    return v.toLocaleString(undefined, { maximumFractionDigits: 6 });
+  }
+
+  /**
+   * Years are integers that must never be grouped ("1,980") or compacted
+   * ("2k") — which is exactly what a generic number formatter does to them.
+   */
+  function looksLikeYears(values) {
+    return (
+      values.length > 0 &&
+      values.every((v) => Number.isInteger(v) && v >= 1000 && v <= 9999)
+    );
+  }
+
+  /** Everything the axes and formatters need to know about a chart's x values. */
+  function axisInfo(spec) {
+    const xs = spec.series.flatMap((s) => s.points.map((p) => p.x));
+    const categorical = xs.some((x) => typeof x === "string");
+    const nums = xs.filter((x) => typeof x === "number");
+    const years = !categorical && looksLikeYears(nums);
+    return {
+      categorical,
+      years,
+      integerX: !categorical && nums.length > 0 && nums.every(Number.isInteger),
+      formatX: categorical
+        ? (v) => String(v)
+        : years
+          ? (v) => String(Math.round(v))
+          : formatCompact,
+    };
+  }
 
   /**
    * Partial arguments arrive as incompletely-parsed JSON, so every field is
@@ -157,18 +267,63 @@
     return raw.map(cleanChart).filter((c) => c !== null);
   }
 
-  function toEchartsSeries(spec) {
+  function toEchartsSeries(spec, endLabels) {
     const type = spec.kind === "area" ? "line" : spec.kind;
-    return spec.series.map((s, i) => ({
-      name: s.name,
-      type,
-      data: s.points.map((p) => [p.x, p.y]),
-      smooth: spec.kind === "line" || spec.kind === "area",
-      symbolSize: spec.kind === "scatter" ? 9 : 5,
-      areaStyle: spec.kind === "area" ? { opacity: 0.18 } : undefined,
-      itemStyle: { color: PALETTE[i % PALETTE.length] },
-      lineStyle: { width: 2 },
-    }));
+    const isLine = type === "line";
+    return spec.series.map((s, i) => {
+      const color = seriesColor(i);
+      return {
+        name: s.name,
+        type,
+        data: s.points.map((p) => [p.x, p.y]),
+        // No smoothing. A spline invents curvature between measured points —
+        // it reads as data the series does not contain.
+        smooth: false,
+        // A marker on every point is noise past a few dozen: the line already
+        // carries the shape and the tooltip carries the values.
+        showSymbol: isLine ? s.points.length <= 30 : true,
+        symbolSize: spec.kind === "scatter" ? 9 : 8,
+        itemStyle: {
+          color,
+          // A 2px surface ring keeps overlapping scatter markers countable —
+          // that is a spacer, not a border drawn to separate marks.
+          borderColor: INK.surface,
+          borderWidth: spec.kind === "scatter" ? 2 : 0,
+          borderRadius: type === "bar" ? [4, 4, 0, 0] : undefined,
+        },
+        lineStyle: isLine ? { width: 2, color } : undefined,
+        areaStyle: spec.kind === "area" ? { color, opacity: 0.14 } : undefined,
+        emphasis: { focus: "series" },
+        // Direct label on the final point only — never a number on every
+        // point. `show: false` rather than undefined so a chart that stops
+        // qualifying for end labels actually loses them on the next merge.
+        endLabel: {
+          show: isLine && endLabels,
+          distance: 6,
+          color: INK.secondary,
+          fontSize: 11,
+          formatter: (p) => formatCompact(p.value[1]),
+        },
+        barMaxWidth: 42,
+        barGap: "12%",
+      };
+    });
+  }
+
+  function tooltipHTML(params, ax) {
+    const rows = Array.isArray(params) ? params : [params];
+    if (rows.length === 0) return "";
+    const first = rows[0];
+    const head = Array.isArray(first.value) ? ax.formatX(first.value[0]) : first.name;
+    const body = rows
+      .map(
+        (p) =>
+          `<div style="display:flex;gap:8px;align-items:baseline;">${p.marker}` +
+          `<span style="flex:1 1 auto;">${escapeHTML(p.seriesName)}</span>` +
+          `<b style="font-variant-numeric:tabular-nums;">${formatFull(Array.isArray(p.value) ? p.value[1] : p.value)}</b></div>`,
+      )
+      .join("");
+    return `<div style="opacity:.7;margin-bottom:4px;">${escapeHTML(String(head))}</div>${body}`;
   }
 
   function gridColumns(n) {
@@ -180,7 +335,7 @@
    * charts array grows/shrinks between partials — this only churns instances
    * when the *count* changes, not on every redraw.
    */
-  let cells = []; // { cell, titleEl, inst }
+  let cells = []; // { cell, titleEl, inst, seriesCount, kind }
 
   function ensureCells(n) {
     if (n === cells.length) return;
@@ -194,9 +349,12 @@
       mountEl.className = "chart-cell-mount";
       cellEl.append(cellTitleEl, mountEl);
       canvasRoot.appendChild(cellEl);
-      const inst = echarts.init(mountEl, dark ? "dark" : null, { renderer: "canvas" });
+      // No built-in theme: the "dark" theme ships its own palette and paints
+      // an opaque navy background that fights whatever surface the host has.
+      // Colours come from the validated tokens above instead.
+      const inst = echarts.init(mountEl, null, { renderer: "canvas" });
       inst.getDom().style.background = "transparent";
-      cells.push({ cell: cellEl, titleEl: cellTitleEl, inst });
+      cells.push({ cell: cellEl, titleEl: cellTitleEl, inst, seriesCount: 0, kind: null });
     }
     while (cells.length > n) {
       const { cell, inst } = cells.pop();
@@ -218,40 +376,193 @@
     cells.forEach(({ inst }) => inst.resize());
   }
 
-  function drawChart(spec, { inst, titleEl: cellTitleEl }, showCellTitle) {
+  function drawChart(spec, cellState, { showCellTitle, endLabels }) {
+    const { inst, titleEl: cellTitleEl } = cellState;
     if (showCellTitle) cellTitleEl.textContent = spec.title || "Chart";
 
-    const categorical = spec.series.some((s) =>
-      s.points.some((p) => typeof p.x === "string"),
-    );
+    // setOption merges by index — that merge is what makes streaming partials
+    // append instead of redraw, but it cannot express "this chart now has
+    // fewer series" or "it changed type", so those two cases reset first.
+    if (
+      spec.series.length < cellState.seriesCount ||
+      (cellState.kind !== null && cellState.kind !== spec.kind)
+    ) {
+      inst.clear();
+    }
+    cellState.seriesCount = spec.series.length;
+    cellState.kind = spec.kind;
+
+    const ax = axisInfo(spec);
+    const multi = spec.series.length > 1;
+    // Bars and filled areas encode magnitude by extent, so their baseline has
+    // to be zero or the lengths lie. A line or scatter encodes position —
+    // pinning it to zero just flattens the shape into a stripe.
+    const zeroBaseline = spec.kind === "bar" || spec.kind === "area";
 
     inst.setOption({
       animationDuration: 320,
       animationDurationUpdate: 320,
-      grid: { left: 48, right: 16, top: 20, bottom: 40, containLabel: true },
-      tooltip: { trigger: "axis" },
-      legend: spec.series.length > 1 ? { bottom: 0, icon: "roundRect", textStyle: { fontSize: 10 } } : undefined,
+      aria: { enabled: true },
+      color: spec.series.map((_, i) => seriesColor(i)),
+      textStyle: { fontFamily: "ui-sans-serif, system-ui, sans-serif" },
+      grid: {
+        // containLabel reserves room for tick LABELS only — an axis *name* is
+        // laid out beyond that and gets clipped off the canvas unless the
+        // corresponding side is padded here. Hence the per-side bumps.
+        left: 8,
+        right: endLabels ? 56 : 16,
+        top: (multi ? 34 : 12) + (spec.yLabel ? 18 : 0),
+        bottom: spec.xLabel ? 28 : 6,
+        containLabel: true,
+      },
+      tooltip: {
+        trigger: spec.kind === "scatter" ? "item" : "axis",
+        axisPointer: { type: "line", snap: true, lineStyle: { color: INK.axis, width: 1 } },
+        backgroundColor: INK.surface,
+        borderColor: INK.grid,
+        borderWidth: 1,
+        padding: [8, 10],
+        textStyle: { color: INK.primary, fontSize: 12 },
+        formatter: (params) => tooltipHTML(params, ax),
+      },
+      // A legend is always present for 2+ series so identity is never carried
+      // by colour alone; one series needs none — the title names it.
+      legend: multi
+        ? {
+            top: 0,
+            left: "center",
+            icon: "roundRect",
+            itemWidth: 10,
+            itemHeight: 10,
+            itemGap: 14,
+            textStyle: { color: INK.secondary, fontSize: 11 },
+          }
+        : { show: false },
       xAxis: {
-        type: categorical ? "category" : "value",
-        name: spec.xLabel,
+        type: ax.categorical ? "category" : "value",
+        name: spec.xLabel || "",
         nameLocation: "middle",
-        nameGap: 26,
+        nameGap: 28,
+        nameTextStyle: { color: INK.secondary, fontSize: 11 },
+        // A value axis defaults to scale:false, which forces zero into the
+        // range. On a 1974–2024 axis that stretches the plot to 0–2500 and
+        // crushes every point into a sliver at the right edge. x is a
+        // position, never a magnitude — always fit it to the data.
+        scale: true,
+        // With only `scale`, ECharts still rounds the ends out to the next
+        // nice tick — a 1974–2024 series gets a 1970–2030 axis and gives up a
+        // fifth of the plot to empty margin. A year domain pins to its real
+        // extent instead (minInterval keeps those ticks whole). Other numeric
+        // domains keep the rounding: there the round end IS the clean one,
+        // and a pinned end just crowds a stray label against its neighbour.
+        min: ax.years ? "dataMin" : undefined,
+        max: ax.years ? "dataMax" : undefined,
+        minInterval: ax.integerX ? 1 : 0,
+        boundaryGap: ax.categorical ? spec.kind === "bar" : [0, 0],
+        axisLine: { lineStyle: { color: INK.axis } },
+        axisTick: { show: false },
+        axisLabel: {
+          color: INK.muted,
+          fontSize: 11,
+          hideOverlap: true,
+          formatter: ax.categorical ? undefined : ax.formatX,
+        },
         splitLine: { show: false },
       },
       yAxis: {
         type: "value",
-        name: spec.yLabel,
-        nameLocation: "middle",
-        nameGap: 36,
+        scale: !zeroBaseline,
+        name: spec.yLabel || "",
+        // A horizontal caption above the axis, not a rotated centred name.
+        // `nameGap` on a rotated name is measured from the axis line, so it
+        // has to clear tick text whose width is unknown until after layout —
+        // too small and the caption lands on top of the numbers, too large
+        // and it falls off the canvas, and the gap that works for "40" is
+        // wrong for "1.8M". Above the axis there is nothing to collide with,
+        // and a long unit string stays horizontal and readable.
+        nameLocation: "end",
+        nameRotate: 0,
+        nameGap: 12,
+        nameTextStyle: { color: INK.secondary, fontSize: 11, align: "left" },
+        axisLine: { show: false },
+        axisTick: { show: false },
+        axisLabel: { color: INK.muted, fontSize: 11, formatter: formatCompact },
+        // Solid hairlines one shade off the surface — never dashed, which
+        // reads as "threshold" when it is only a grid.
+        splitLine: { show: true, lineStyle: { color: INK.grid, width: 1, type: "solid" } },
       },
-      series: toEchartsSeries(spec),
+      series: toEchartsSeries(spec, endLabels),
     });
+  }
+
+  /**
+   * The table twin: every plotted value reachable as text — for screen
+   * readers, for anyone who can't separate two hues, and for anyone who wants
+   * the number rather than the shape. Tooltips enhance, they never gate.
+   */
+  function tableHTML(spec) {
+    const ax = axisInfo(spec);
+    const keys = [];
+    const seen = new Set();
+    for (const s of spec.series) {
+      for (const p of s.points) {
+        const k = String(p.x);
+        if (!seen.has(k)) {
+          seen.add(k);
+          keys.push(p.x);
+        }
+      }
+    }
+    if (keys.every((k) => typeof k === "number")) keys.sort((a, b) => a - b);
+
+    const lookups = spec.series.map((s) => {
+      const m = new Map();
+      for (const p of s.points) m.set(String(p.x), p.y);
+      return m;
+    });
+    const labelX = (k) =>
+      typeof k !== "number" ? String(k) : ax.years ? String(k) : formatFull(k);
+
+    const head = `<tr><th scope="col">${escapeHTML(spec.xLabel || "x")}</th>${spec.series
+      .map((s) => `<th scope="col">${escapeHTML(s.name)}</th>`)
+      .join("")}</tr>`;
+    const body = keys
+      .map(
+        (k) =>
+          `<tr><th scope="row">${escapeHTML(labelX(k))}</th>${lookups
+            .map((m) => {
+              const v = m.get(String(k));
+              return `<td>${v === undefined ? "—" : escapeHTML(formatFull(v))}</td>`;
+            })
+            .join("")}</tr>`,
+      )
+      .join("");
+
+    const caption = `${escapeHTML(spec.title || "Chart")}${spec.yLabel ? ` — ${escapeHTML(spec.yLabel)}` : ""}`;
+    return `<table><caption>${caption}</caption><thead>${head}</thead><tbody>${body}</tbody></table>`;
   }
 
   /**
    * setOption merges by default, so re-issuing it with a longer data array
    * appends points and animates the transition. Nothing already drawn moves.
    */
+  let tableOpen = false;
+  let lastCharts = [];
+
+  function renderTable(charts) {
+    lastCharts = charts;
+    tableBtn.disabled = charts.length === 0;
+    if (tableOpen) tableWrap.innerHTML = charts.map(tableHTML).join("");
+  }
+
+  tableBtn.addEventListener("click", () => {
+    tableOpen = !tableOpen;
+    tableWrap.hidden = !tableOpen;
+    tableBtn.setAttribute("aria-expanded", String(tableOpen));
+    tableBtn.textContent = tableOpen ? "Hide table" : "Table";
+    if (tableOpen) tableWrap.innerHTML = lastCharts.map(tableHTML).join("");
+  });
+
   function draw(args) {
     const charts = clean(args);
     ensureCells(charts.length);
@@ -260,8 +571,17 @@
     let totalPoints = 0;
     charts.forEach((spec, i) => {
       totalPoints += spec.series.reduce((n, s) => n + s.points.length, 0);
-      drawChart(spec, cells[i], showCellTitles);
+      drawChart(spec, cells[i], {
+        showCellTitle: showCellTitles,
+        // End labels replace hunting the axis for the final value, but only
+        // where there is room for them: one chart, a handful of lines.
+        endLabels:
+          charts.length === 1 &&
+          spec.series.length <= 4 &&
+          (spec.kind === "line" || spec.kind === "area"),
+      });
     });
+    renderTable(charts);
 
     titleEl.textContent =
       charts.length === 0
@@ -289,7 +609,7 @@
 
   async function chartsPNGDataURL() {
     if (cells.length === 0) return null;
-    const bg = dark ? "#17171a" : "#ffffff";
+    const bg = INK.surface;
     if (cells.length === 1) {
       return cells[0].inst.getDataURL({ type: "png", pixelRatio: 2, backgroundColor: bg });
     }

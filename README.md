@@ -69,6 +69,47 @@ Reserve true incremental re-layout for graphs that grow from a live data source
 where the final shape genuinely isn't knowable up front. Cytoscape's
 `layout.run({ animate: true })` tweens between solutions if you need it.
 
+## Chart styling rules
+
+These are load-bearing, not taste. Each one exists because its absence produced
+a visibly broken chart.
+
+**A value x-axis must set `scale: true`.** ECharts defaults it to `false`, which
+forces zero into the range — a 1974–2024 series then renders on a 0–2500 axis
+with every point crushed into a sliver at the right edge. On top of that, a
+*year* domain pins `min`/`max` to `dataMin`/`dataMax`: `scale` alone still rounds
+the ends out to the next nice tick (1970–2030) and gives up a fifth of the plot
+to margin. Other numeric domains keep the rounding — there the round end is the
+clean one.
+
+**The y-axis baseline depends on the mark.** Bars and filled areas encode
+magnitude by extent, so they sit on zero (`scale: false`) or the lengths lie.
+Lines and scatters encode position, so they fit the data (`scale: true`);
+pinning them to zero flattens the shape into a stripe.
+
+**Axis names are laid out beyond `containLabel`.** `containLabel` reserves room
+for tick *labels* only, so an axis name needs its own padding on that side of
+the grid. The y unit is a horizontal caption above the axis (`nameLocation:
+"end"`, `nameRotate: 0`) rather than a rotated centred name: `nameGap` on a
+rotated name is measured from the axis line, so it has to clear tick text whose
+width isn't known until after layout — the gap that works for `40` puts the
+caption on top of `1.8M`, and the gap that clears `1.8M` pushes it off canvas.
+
+**The palette is validated, ordered, and never cycled.** Eight fixed hues, each
+mode stepped for its own surface (`PALETTE_LIGHT` / `PALETTE_DARK` — the dark
+column is not an automatic flip). Slots are assigned in declaration order; a
+ninth series takes muted grey rather than a generated hue that a colourblind
+reader can't separate from an earlier slot. The view does **not** use ECharts'
+built-in `dark` theme — it ships its own palette and paints an opaque navy
+background over whatever surface the host has.
+
+**Everything else:** no smoothing (a spline invents curvature between measured
+points); markers only under ~30 points per line; solid hairline gridlines on y
+only, never dashed; a legend whenever there are 2+ series and none for one; end
+labels on the last point only, and only when there's room (single chart, ≤4
+line series). The `Table` button is the chart's WCAG-clean twin and lives
+outside `#canvas` so opening it never changes the exported PNG.
+
 ### Context budget
 
 Tool results carry a one-line summary in `content` and the full dataset in

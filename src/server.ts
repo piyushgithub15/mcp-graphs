@@ -125,9 +125,14 @@ async function loadView(file: string): Promise<string> {
  * full-width responsive layout; 2+ charts lay out as a fixed-cell grid (see
  * chart-view.html), so the size here must match that grid's own math or the
  * screenshot clips or leaves dead space.
+ *
+ * The single-chart viewport is wide enough (and the mount tall enough, see
+ * `#canvas.single .chart-cell-mount`) that the exported PNG lands around
+ * 1640x800 at deviceScaleFactor 2 — a chart that stays legible pasted into a
+ * doc or slide, rather than a 640px thumbnail that has to be upscaled.
  */
 function chartCanvasSize(count: number): { width: number; height: number } {
-  if (count <= 1) return { width: 640, height: 380 };
+  if (count <= 1) return { width: 820, height: 470 };
   const cols = count <= 4 ? 2 : 3;
   const rows = Math.ceil(count / cols);
   const cellWidth = 480;
