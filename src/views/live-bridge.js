@@ -14,6 +14,14 @@
 const params = new URL(import.meta.url).searchParams;
 const kind = params.get("kind") === "graph" ? "graph" : "chart";
 
+// The preview page gives every chart its own pane rather than packing a
+// multi-chart call into one scrolling frame, so a pane asks for a single
+// index out of the render_chart payload. The view itself is untouched — it
+// just receives a one-chart argument set and lays it out full size.
+const indexParam = params.get("index");
+const chartIndex =
+  indexParam === null || indexParam === "" ? null : Number.parseInt(indexParam, 10);
+
 function addStatusBadge() {
   const badge = document.createElement("div");
   badge.textContent = "Waiting for a real tool call\u2026";
@@ -46,20 +54,56 @@ export class App {
 
   async connect() {
     const badge = addStatusBadge();
-    const source = new EventSource(`/preview/stream?kind=${kind}`);
 
-    source.onmessage = (event) => {
-      let args;
-      try {
-        args = JSON.parse(event.data);
-      } catch {
-        return;
-      }
+    const apply = (args) => {
       badge.style.opacity = "0";
       this.ontoolinput?.({ arguments: args });
       this.ontoolresult?.({ structuredContent: args });
     };
 
+    // Inside the preview page, data arrives over postMessage rather than a
+    // stream of our own. Browsers cap concurrent connections per origin at
+    // around six, so one EventSource per pane runs out of sockets the moment
+    // a call renders five or six charts \u2014 and the last pane hangs on
+    // "Waiting for data" forever, with nothing in the console to show for it.
+    // The parent holds one stream per kind and fans payloads out instead.
+    if (window.parent && window.parent !== window) {
+      window.addEventListener("message", (event) => {
+        if (event.origin !== location.origin || event.source !== window.parent) return;
+        const msg = event.data;
+        if (msg && msg.type === "viz-data") apply(msg.payload);
+      });
+      // Announce which pane this is; the parent replies with our slice. Sent
+      // after the listener is attached so the reply can't be missed, and it
+      // covers a frame that finishes loading long after the data arrived.
+      window.parent.postMessage(
+        { type: "viz-ready", kind, index: chartIndex },
+        location.origin,
+      );
+      return;
+    }
+
+    // Opened directly rather than embedded \u2014 keep the standalone page working.
+    const source = new EventSource(`/preview/stream?kind=${kind}`);
+    source.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        // The graph stream carries every diagram rendered so far. Standalone,
+        // show the one this URL asked for, or the most recent.
+        if (payload && Array.isArray(payload.diagrams)) {
+          const list = payload.diagrams;
+          const pick =
+            chartIndex !== null && !Number.isNaN(chartIndex)
+              ? list[chartIndex]
+              : list[list.length - 1];
+          if (pick) apply(pick);
+          return;
+        }
+        apply(payload);
+      } catch {
+        /* half-written frame; the next one supersedes it */
+      }
+    };
     source.onerror = () => {
       badge.textContent = "Disconnected \u2014 retrying\u2026";
       badge.style.opacity = "0.9";

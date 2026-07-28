@@ -110,7 +110,10 @@
      border/mini-title, matching the original single-canvas layout exactly. */
   #canvas.single .chart-cell { border: none; }
   #canvas.single .chart-cell-title { display: none; }
-  #canvas.single .chart-cell-mount { width: 100%; height: 400px; }
+  /* The fixed height is what sizes the exported PNG. The browsable preview
+     overrides the variable so a pane can fill its frame instead of leaving
+     the bottom of the screen empty; the export path never sets it. */
+  #canvas.single .chart-cell-mount { width: 100%; height: var(--viz-chart-height, 400px); }
   /* Table twin — the WCAG-clean equivalent of the plot. Scrolls inside its
      own box so a wide table never makes the whole view scroll sideways. */
   #tableWrap { margin-top: 14px; overflow-x: auto; }

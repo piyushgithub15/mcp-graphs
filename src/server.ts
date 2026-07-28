@@ -226,6 +226,30 @@ function publishPreview(kind: PreviewKind, args: unknown) {
 }
 
 /**
+ * Every diagram rendered so far, in call order.
+ *
+ * render_chart takes an array and so gets several panes for free, but
+ * render_diagram draws one graph per call — and a single latest-wins slot
+ * meant a second call silently replaced the first, leaving no way to show
+ * four flowcharts side by side. Diagrams accumulate here instead, and the
+ * preview gives each one its own pane exactly like a chart.
+ */
+const diagramList: unknown[] = [];
+const MAX_DIAGRAMS = 6;
+
+function publishDiagram(args: { title?: string }) {
+  const titleOf = (d: unknown) => String((d as { title?: string } | undefined)?.title ?? "");
+  const at = diagramList.findIndex((d) => titleOf(d) === titleOf(args));
+  // Re-rendering the same title supersedes it in place rather than stacking
+  // a near-identical pane beside the original.
+  if (at >= 0) diagramList[at] = args;
+  else diagramList.push(args);
+  while (diagramList.length > MAX_DIAGRAMS) diagramList.shift();
+
+  publishPreview("graph", { diagrams: [...diagramList] });
+}
+
+/**
  * Wraps a view's HTML fragment in a real document and remaps the ext-apps
  * CDN import to /views/live-bridge.js via an import map. The view file
  * itself is served byte-for-byte unmodified — only its module import target
@@ -233,16 +257,28 @@ function publishPreview(kind: PreviewKind, args: unknown) {
  * would load. live-bridge.js listens on /preview/stream for real tool-call
  * data instead of simulating any.
  */
-function wrapPreview(viewHtml: string, kind: PreviewKind): string {
+function wrapPreview(viewHtml: string, kind: PreviewKind, index?: number): string {
   const EXT_APPS_SPECIFIER =
     "https://cdn.jsdelivr.net/npm/@modelcontextprotocol/ext-apps@1/+esm";
+  const bridge =
+    `/views/live-bridge.js?kind=${kind}` + (index === undefined ? "" : `&index=${index}`);
   return `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8" />
-<title>${kind === "chart" ? "Chart" : "Graph"} preview</title>
+<title>${kind === "chart" ? "Chart" : "Diagram"} preview</title>
+<style>
+  /* Fill the pane the preview page hands us. Both views default to a fixed
+     canvas height — that default is what sizes the exported PNG, so it stays
+     put and only the browsable preview overrides it. */
+  html, body { height: 100%; box-sizing: border-box; }
+  :root {
+    --viz-chart-height: calc(100vh - 88px);
+    --viz-graph-height: calc(100vh - 88px);
+  }
+</style>
 <script type="importmap">
-${JSON.stringify({ imports: { [EXT_APPS_SPECIFIER]: `/views/live-bridge.js?kind=${kind}` } })}
+${JSON.stringify({ imports: { [EXT_APPS_SPECIFIER]: bridge } })}
 </script>
 </head>
 <body style="margin:16px;">
@@ -378,7 +414,7 @@ export function buildServer(): McpServer {
         args.nodes.length,
         "Layout solved",
       );
-      publishPreview("graph", args);
+      publishDiagram(args);
 
       const content: ToolResultContent[] = [
         {
@@ -524,49 +560,23 @@ export function createApp() {
     res.type("png").send(png);
   });
 
-  // Which kinds actually have data, pushed as it arrives. /preview uses this
-  // to mount only the panes that have something in them — an empty frame
-  // captioned "Waiting for data" is noise, not information.
-  app.get("/preview/presence", (req, res) => {
-    res.set({
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    });
-    res.flushHeaders();
-
-    const send = () =>
-      res.write(
-        `data: ${JSON.stringify({
-          chart: latestByKind.chart !== undefined,
-          graph: latestByKind.graph !== undefined,
-        })}\n\n`,
-      );
-    send();
-
-    const onUpdate = () => send();
-    liveUpdates.on("chart", onUpdate);
-    liveUpdates.on("graph", onUpdate);
-    const heartbeat = setInterval(() => res.write(": ping\n\n"), 25000);
-
-    req.on("close", () => {
-      liveUpdates.off("chart", onUpdate);
-      liveUpdates.off("graph", onUpdate);
-      clearInterval(heartbeat);
-    });
-  });
-
   // Each view needs the ext-apps import remapped to a different
   // live-bridge.js query param, which an import map can't express for two
   // inline modules in one document. So each view still gets its own
   // document, and /preview lays both out on one page — side by side on wide
   // screens, stacked on narrow ones — instead of switching between tabs.
-  app.get("/preview/chart", async (_req, res) => {
-    res.type("html").send(wrapPreview(await loadView("chart-view.html"), "chart"));
+  // ?index=N renders just that one chart out of the last render_chart call,
+  // which is how the preview page gives each chart its own pane.
+  app.get("/preview/chart", async (req, res) => {
+    const raw = Number.parseInt(String(req.query.index ?? ""), 10);
+    const index = Number.isInteger(raw) && raw >= 0 ? raw : undefined;
+    res.type("html").send(wrapPreview(await loadView("chart-view.html"), "chart", index));
   });
 
-  app.get("/preview/graph", async (_req, res) => {
-    res.type("html").send(wrapPreview(await loadView("graph-view.html"), "graph"));
+  app.get("/preview/graph", async (req, res) => {
+    const raw = Number.parseInt(String(req.query.index ?? ""), 10);
+    const index = Number.isInteger(raw) && raw >= 0 ? raw : undefined;
+    res.type("html").send(wrapPreview(await loadView("graph-view.html"), "graph", index));
   });
 
   app.get("/preview", (_req, res) => {
@@ -586,28 +596,28 @@ export function createApp() {
   @media (prefers-color-scheme: dark) {
     body { background: #17171a; color: #e8e6e1; }
   }
-  /* No page chrome — the rendered chart or diagram IS the page. Each view
-     already carries its own title row, so a heading above it would just
-     repeat itself.
+  /* No page chrome — the rendered charts and diagram ARE the page. Each view
+     already carries its own title row, so a heading above it would repeat
+     itself.
 
-     A pane is mounted only once its kind actually has data, so this is the
-     chart, the diagram, or both — never an empty frame captioned "Waiting
-     for data". A lone pane takes the full width and more height; two sit
-     side by side once there's room, each with its own frame so neither
-     bleeds into the other while both are live-updating. */
+     Every chart and every diagram gets its OWN pane. A multi-chart call used
+     to be packed into a single frame that scrolled internally while the
+     bottom half of the window sat empty; here each one is a first-class
+     panel, and the panes are sized to fill the viewport rather than to a
+     fixed pixel height. */
   #panes {
     display: grid;
-    grid-template-columns: 1fr;
     gap: 16px;
     padding: 16px;
     box-sizing: border-box;
-  }
-  @media (min-width: 900px) {
-    #panes.both { grid-template-columns: 1fr 1fr; }
+    grid-template-columns: 1fr;
   }
   .pane {
     display: flex;
     min-width: 0;
+    /* Set per layout pass from the pane count, so few panes fill the screen
+       and many tile at a readable height and let the page scroll. */
+    height: var(--pane-h, 520px);
     border: 1px solid rgba(128,128,128,0.25);
     border-radius: 10px;
     overflow: hidden;
@@ -616,64 +626,158 @@ export function createApp() {
   .pane iframe {
     display: block;
     width: 100%;
-    height: 480px;
+    height: 100%;
     border: none;
     /* flex-basis:auto (not the flex:1 shorthand's 0%) so the height above is
-       actually honored instead of collapsing to the browser's default 150px
-       iframe height. */
+       honored instead of collapsing to the browser's default 150px. */
     flex: 0 1 auto;
   }
-  /* Just past the view's own content height (title row + 400px canvas + its
-     16px body margins) — enough that a taller diagram layout isn't cropped,
-     without leaving a slab of dead pane below a chart. */
-  #panes.one .pane iframe { height: 520px; }
-  /* Nothing rendered yet: one quiet line, not a pair of empty boxes. */
+  /* Nothing rendered yet: one quiet line, not a grid of empty boxes. */
   #idle { padding: 18px; margin: 0; font-size: 13px; opacity: 0.5; }
   /* display on .pane/#panes would otherwise beat the hidden attribute. */
-  #idle[hidden], .pane[hidden], #panes[hidden] { display: none; }
+  #idle[hidden], #panes[hidden] { display: none; }
 </style>
 </head>
 <body>
 <p id="idle">Waiting for a chart or diagram…</p>
-<div id="panes" hidden>
-  <div class="pane" id="pane-chart" hidden></div>
-  <div class="pane" id="pane-graph" hidden></div>
-</div>
+<div id="panes" hidden></div>
 <script>
   const panes = document.getElementById("panes");
   const idle = document.getElementById("idle");
-  const mounted = {};
+  const mounted = new Map();
+  const latest = { chart: null, graph: null };
+  let paneCount = 0;
 
-  // Mount lazily: a kind that never renders never loads its view at all.
-  function ensure(kind) {
-    const pane = document.getElementById("pane-" + kind);
-    if (!mounted[kind]) {
-      const frame = document.createElement("iframe");
-      frame.src = "/preview/" + kind;
-      frame.title = kind === "chart" ? "Chart" : "Diagram";
-      frame.setAttribute("allow", "clipboard-write");
-      pane.appendChild(frame);
-      mounted[kind] = true;
-    }
-    pane.hidden = false;
+  // Mount lazily and keep each pane across updates: re-creating the iframes on
+  // every event would reload every view and replay its draw animation.
+  function ensure(key, kind, index, src, title) {
+    let entry = mounted.get(key);
+    if (entry) return entry;
+
+    const pane = document.createElement("div");
+    pane.className = "pane";
+    const frame = document.createElement("iframe");
+    frame.src = src;
+    frame.title = title;
+    frame.setAttribute("allow", "clipboard-write");
+    pane.appendChild(frame);
+    panes.appendChild(pane);
+
+    entry = { pane, frame, kind, index };
+    mounted.set(key, entry);
+    return entry;
   }
 
-  const source = new EventSource("/preview/presence");
-  source.onmessage = (event) => {
-    let present;
-    try {
-      present = JSON.parse(event.data);
-    } catch {
-      return;
+  function chartsOf() {
+    return latest.chart && Array.isArray(latest.chart.charts) ? latest.chart.charts : [];
+  }
+
+  function diagramsOf() {
+    return latest.graph && Array.isArray(latest.graph.diagrams) ? latest.graph.diagrams : [];
+  }
+
+  // One chart and one diagram per pane: each frame gets a single-item
+  // argument set carved out of the accumulated payload.
+  function payloadFor(entry) {
+    if (entry.kind === "graph") return diagramsOf()[entry.index] ?? null;
+    const args = latest.chart;
+    const one = chartsOf()[entry.index];
+    return one ? { ...args, charts: [one] } : null;
+  }
+
+  function post(entry) {
+    const payload = payloadFor(entry);
+    if (payload) {
+      entry.frame.contentWindow?.postMessage(
+        { type: "viz-data", payload },
+        location.origin,
+      );
     }
-    if (present.chart) ensure("chart");
-    if (present.graph) ensure("graph");
-    const shown = (present.chart ? 1 : 0) + (present.graph ? 1 : 0);
-    panes.classList.toggle("both", shown === 2);
-    panes.classList.toggle("one", shown === 1);
-    panes.hidden = shown === 0;
-    idle.hidden = shown > 0;
-  };
+  }
+
+  // A frame that has just finished loading asks for its slice — which is what
+  // makes a pane mounted after the data arrived still fill in.
+  window.addEventListener("message", (event) => {
+    if (event.origin !== location.origin) return;
+    const msg = event.data;
+    if (!msg || msg.type !== "viz-ready") return;
+    for (const entry of mounted.values()) {
+      if (entry.frame.contentWindow === event.source) post(entry);
+    }
+  });
+
+  /**
+   * Columns come from the pane count, and pane height from how many rows that
+   * makes — capped at two rows on screen at once so panes never shrink to
+   * unreadable slivers. Up to two rows the grid fills the window exactly;
+   * beyond that the page scrolls.
+   */
+  function layout() {
+    if (paneCount === 0) return;
+    const narrow = window.innerWidth < 760;
+    const diagramCount = diagramsOf().length;
+    // A left-to-right flowchart needs width far more than a bar chart does —
+    // a twelve-node chain fitted into a third of the screen is legible only
+    // as a smudge. So a lone diagram takes a full row of its own (below),
+    // and once there are several the whole grid drops to two columns rather
+    // than stacking spans, which only produces holes.
+    const cols = narrow
+      ? 1
+      : diagramCount > 1
+        ? 2
+        : paneCount <= 1
+          ? 1
+          : paneCount <= 4
+            ? 2
+            : 3;
+    const rows = Math.min(Math.ceil(paneCount / cols), 2);
+    panes.style.gridTemplateColumns = \`repeat(\${cols}, minmax(0, 1fr))\`;
+    // 32px of page padding, plus one 16px gap between each on-screen row.
+    panes.style.setProperty(
+      "--pane-h",
+      \`calc((100vh - 32px - \${(rows - 1) * 16}px) / \${rows})\`,
+    );
+
+    const lone = mounted.get("graph-0");
+    if (lone) {
+      lone.pane.style.gridColumn = diagramCount === 1 && cols > 1 ? "1 / -1" : "";
+    }
+  }
+
+  function refresh() {
+    const charts = chartsOf();
+    const diagrams = diagramsOf();
+    for (let i = 0; i < charts.length; i++) {
+      ensure("chart-" + i, "chart", i, "/preview/chart?index=" + i, "Chart " + (i + 1));
+    }
+    for (let i = 0; i < diagrams.length; i++) {
+      ensure("graph-" + i, "graph", i, "/preview/graph?index=" + i, "Diagram " + (i + 1));
+    }
+
+    paneCount = charts.length + diagrams.length;
+    panes.hidden = paneCount === 0;
+    idle.hidden = paneCount > 0;
+    layout();
+    for (const entry of mounted.values()) post(entry);
+  }
+
+  // Exactly two streams for the whole page, however many panes it grows.
+  function subscribe(kind) {
+    const source = new EventSource("/preview/stream?kind=" + kind);
+    source.onmessage = (event) => {
+      try {
+        latest[kind] = JSON.parse(event.data);
+      } catch {
+        return; // half-written frame; the next one supersedes it
+      }
+      refresh();
+    };
+  }
+
+  subscribe("chart");
+  subscribe("graph");
+
+  window.addEventListener("resize", layout);
 </script>
 </body>
 </html>`);

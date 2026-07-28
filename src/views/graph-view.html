@@ -94,7 +94,9 @@
   }
   /* canvas sits in normal flow below #head/#staging, never underneath them,
      so the diagram itself can never overlap the title/actions row. */
-  #canvas { width: 100%; height: 420px; }
+  /* Fixed height sizes the exported PNG; the browsable preview overrides the
+     variable so the diagram fills its pane. The export path never sets it. */
+  #canvas { width: 100%; height: var(--viz-graph-height, 420px); }
   @media (prefers-color-scheme: dark) {
     #root { color: var(--mcp-text, #e8e6e1); }
   }
@@ -391,6 +393,16 @@
 
     downloadPNG(dataUrl);
     flashExportStatus("Clipboard blocked by this page — saved as PNG instead", 3200);
+  });
+
+  // Layout fits the graph to the canvas once, at build time. When the frame
+  // is later resized — the preview page sizes panes from the viewport — the
+  // solved positions stay valid but the zoom no longer matches, so re-fit
+  // rather than re-run layout, which would move nodes that already settled.
+  window.addEventListener("resize", () => {
+    if (!cy) return;
+    cy.resize();
+    cy.fit(undefined, 24);
   });
 
   const app = new App({ name: "graph-view", version: "1.0.0" }, { tools: {} });
