@@ -71,7 +71,12 @@ export class App {
       window.addEventListener("message", (event) => {
         if (event.origin !== location.origin || event.source !== window.parent) return;
         const msg = event.data;
-        if (msg && msg.type === "viz-data") apply(msg.payload);
+        if (!msg) return;
+        if (msg.type === "viz-data") apply(msg.payload);
+        // Paging: this frame was display:none and therefore had no size, so
+        // the view never laid itself out for the pane. Both views redraw on
+        // resize, so replay one now that the frame is actually visible.
+        if (msg.type === "viz-refresh") window.dispatchEvent(new Event("resize"));
       });
       // Announce which pane this is; the parent replies with our slice. Sent
       // after the listener is attached so the reply can't be missed, and it

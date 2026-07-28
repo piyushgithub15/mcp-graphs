@@ -632,21 +632,62 @@ export function createApp() {
        honored instead of collapsing to the browser's default 150px. */
     flex: 0 1 auto;
   }
+  /* Embedded in something short — a chat card, say — tiling gives every pane
+     a couple of hundred pixels and the axes collapse into each other. Below
+     the size where a tile stays readable the page shows ONE pane at full
+     size and pages through them instead. */
+  #panes.single .pane { display: none; }
+  #panes.single .pane.current { display: flex; }
+  #pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding: 0 16px 12px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    opacity: 0.75;
+  }
+  #pager button {
+    appearance: none;
+    border: 1px solid rgba(128,128,128,0.35);
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    line-height: 1;
+    padding: 5px 11px;
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  #pager button:hover:not(:disabled) { border-color: currentColor; }
+  #pager button:disabled { opacity: 0.35; cursor: default; }
+  #pager button:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+  #label { opacity: 0.7; max-width: 46ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* Nothing rendered yet: one quiet line, not a grid of empty boxes. */
   #idle { padding: 18px; margin: 0; font-size: 13px; opacity: 0.5; }
-  /* display on .pane/#panes would otherwise beat the hidden attribute. */
-  #idle[hidden], #panes[hidden] { display: none; }
+  /* display on .pane/#panes/#pager would otherwise beat the hidden attribute. */
+  #idle[hidden], #panes[hidden], #pager[hidden] { display: none; }
 </style>
 </head>
 <body>
 <p id="idle">Waiting for a chart or diagram…</p>
 <div id="panes" hidden></div>
+<div id="pager" hidden>
+  <button id="prev" type="button" aria-label="Previous">‹</button>
+  <span id="label"></span>
+  <button id="next" type="button" aria-label="Next">›</button>
+</div>
 <script>
   const panes = document.getElementById("panes");
   const idle = document.getElementById("idle");
+  const pager = document.getElementById("pager");
+  const label = document.getElementById("label");
+  const prev = document.getElementById("prev");
+  const next = document.getElementById("next");
   const mounted = new Map();
   const latest = { chart: null, graph: null };
   let paneCount = 0;
+  let current = 0;
 
   // Mount lazily and keep each pane across updates: re-creating the iframes on
   // every event would reload every view and replay its draw animation.
@@ -706,31 +747,51 @@ export function createApp() {
     }
   });
 
+  // Below these a pane stops being worth showing: axis labels start colliding
+  // and a plot reads as a smudge.
+  const MIN_PANE_H = 300;
+  const MIN_PANE_W = 380;
+
   /**
-   * Columns come from the pane count, and pane height from how many rows that
-   * makes — capped at two rows on screen at once so panes never shrink to
-   * unreadable slivers. Up to two rows the grid fills the window exactly;
-   * beyond that the page scrolls.
+   * Decide between tiling and one-at-a-time by measuring what a tile would
+   * actually get, rather than by guessing from the pane count. Columns come
+   * from the available width, pane height from how many rows that makes —
+   * capped at two rows on screen so panes never shrink to slivers. If a tile
+   * would still land under the readable minimum, show a single pane instead.
    */
   function layout() {
     if (paneCount === 0) return;
-    const narrow = window.innerWidth < 760;
+    const availW = window.innerWidth - 32;
+    const availH = window.innerHeight - 32;
     const diagramCount = diagramsOf().length;
-    // A left-to-right flowchart needs width far more than a bar chart does —
-    // a twelve-node chain fitted into a third of the screen is legible only
-    // as a smudge. So a lone diagram takes a full row of its own (below),
-    // and once there are several the whole grid drops to two columns rather
-    // than stacking spans, which only produces holes.
-    const cols = narrow
-      ? 1
-      : diagramCount > 1
-        ? 2
-        : paneCount <= 1
-          ? 1
-          : paneCount <= 4
-            ? 2
-            : 3;
+
+    const fits = Math.max(1, Math.floor((availW + 16) / (MIN_PANE_W + 16)));
+    // A left-to-right flowchart needs width far more than a bar chart does,
+    // so several diagrams cap the grid at two columns rather than three.
+    const cols = Math.min(fits, paneCount, diagramCount > 1 ? 2 : 3);
     const rows = Math.min(Math.ceil(paneCount / cols), 2);
+    const tileH = (availH - (rows - 1) * 16) / rows;
+
+    const single = paneCount > 1 && tileH < MIN_PANE_H;
+    panes.classList.toggle("single", single);
+    pager.hidden = !single;
+
+    if (single) {
+      current = Math.min(current, paneCount - 1);
+      const order = [...mounted.values()];
+      order.forEach((entry, i) => entry.pane.classList.toggle("current", i === current));
+      panes.style.gridTemplateColumns = "1fr";
+      // The pager sits below the pane, so it comes out of the pane's height.
+      panes.style.setProperty("--pane-h", "calc(100vh - 32px - 34px)");
+      const shown = order[current];
+      if (shown) shown.pane.style.gridColumn = "";
+      label.textContent = \`\${current + 1} / \${paneCount}\`;
+      prev.disabled = current === 0;
+      next.disabled = current === paneCount - 1;
+      return;
+    }
+
+    for (const entry of mounted.values()) entry.pane.classList.remove("current");
     panes.style.gridTemplateColumns = \`repeat(\${cols}, minmax(0, 1fr))\`;
     // 32px of page padding, plus one 16px gap between each on-screen row.
     panes.style.setProperty(
@@ -743,6 +804,18 @@ export function createApp() {
       lone.pane.style.gridColumn = diagramCount === 1 && cols > 1 ? "1 / -1" : "";
     }
   }
+
+  // A pane hidden with display:none has no size, so the view inside it never
+  // sized itself for the frame. Nudge it once it's visible.
+  function show(index) {
+    current = Math.max(0, Math.min(index, paneCount - 1));
+    layout();
+    const entry = [...mounted.values()][current];
+    entry?.frame.contentWindow?.postMessage({ type: "viz-refresh" }, location.origin);
+  }
+
+  prev.addEventListener("click", () => show(current - 1));
+  next.addEventListener("click", () => show(current + 1));
 
   function refresh() {
     const charts = chartsOf();
